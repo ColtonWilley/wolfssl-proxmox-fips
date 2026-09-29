@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wolfSSL <support@wolfssl.com>
+Subject: [PATCH] ceph-volume: select FIPS-approved LUKS parameters for encrypted OSDs
+
+ceph-volume calls "cryptsetup luksFormat" with neither --cipher nor --pbkdf,
+so every encrypted OSD takes the LUKS2 defaults: aes-xts-plain64 for the
+volume and argon2id for the keyslot. Neither is inside the wolfCrypt FIPS
+module boundary, and argon2id is not served by wolfProvider at all, so an OSD
+provisioned this way is encrypted with non-approved primitives while reporting
+success.
+
+Select the approved parameters in luks_format() so that "pveceph osd create
+--encrypted" and "ceph-volume lvm create --dmcrypt" produce a conformant
+header with no change at the call site:
+
+  --cipher aes-cbc-essiv:sha256   bulk cipher and per-sector IV hash, served
+                                  by the in-kernel wolfCrypt cbc(aes)
+  --key-size 256                  AES-256. The upstream default of 512 sizes
+                                  an XTS key, which has no meaning for CBC and
+                                  is rejected outright
+  --pbkdf pbkdf2 --hash sha256    keyslot KDF and hash, served by wolfProvider
+
+Arguments supplied through --dmcrypt-format-opts are appended after these and
+therefore still take precedence, so a caller may override any of them.
+
+luks_open() is deliberately left unchanged. On an existing LUKS device the
+volume key size is read from the header and cryptsetup ignores --key-size, so
+the value it passes has no effect on the resulting mapping.
+
+---
+ src/ceph-volume/ceph_volume/util/encryption.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/ceph-volume/ceph_volume/util/encryption.py b/src/ceph-volume/ceph_volume/util/encryption.py
+--- a/src/ceph-volume/ceph_volume/util/encryption.py
++++ b/src/ceph-volume/ceph_volume/util/encryption.py
+@@ -106,7 +106,10 @@
+     base_cmd: List[str] = [
+         'cryptsetup',
+         '--batch-mode', # do not prompt
+-        '--key-size', get_key_size_from_conf(),
++        '--cipher', 'aes-cbc-essiv:sha256',
++        '--key-size', '256',
++        '--pbkdf', 'pbkdf2',
++        '--hash', 'sha256',
+         '--key-file', '-',
+     ]
+
