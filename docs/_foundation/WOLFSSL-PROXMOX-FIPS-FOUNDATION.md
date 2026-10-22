@@ -1,473 +1,265 @@
-# wolfSSL FIPS on Proxmox VE — Shared Build Foundation
+# wolfSSL FIPS for Proxmox VE — Installation
 
-Build the shared kernel and userspace artifacts for wolfSSL FIPS on Proxmox VE once, then follow
-the ZFS, LUKS, or Ceph deployment guide to distribute them to nodes.
+Install the wolfSSL kernel, cryptographic libraries and Proxmox integration from the wolfSSL
+APT repository. Packages supply the binaries, signatures and service configuration; no source
+build or local patching is required.
 
-This guide produces:
+Complete this guide on each node, then configure its storage with the ZFS, LUKS or Ceph guide.
+For a cluster, read [Cluster planning](../storage-cluster/WOLFSSL-PROXMOX-FIPS-CLUSTER.md)
+before installing the first node.
 
-1. **CRNG FIPS kernel** — a custom Proxmox kernel `.deb` and matching headers, with the wolfCrypt
-   CRNG patch, FIPS support, and a retained module-signing key.
-2. **wolfSSL and wolfProvider** — `libwolfssl.so` (FIPS wolfCrypt) and `libwolfprov.so` (the OpenSSL
-   provider), built as a matched pair and installed system-wide. The deployment guides configure
-   services and tools to use the provider.
+## 1. Requirements and repository choice
 
-Run every command in order, as root, on the builder: a fresh PVE 9.2 node. The artifacts are written
-to `/root`. Replace each `<placeholder>` with the real value.
+Start with a fresh Proxmox VE 9.2 installation on amd64, updated from the appropriate
+[Proxmox repositories](https://pve.proxmox.com/pve-docs/chapter-sysadmin.html#sysadmin_package_repositories).
+The [Proxmox installation guide](https://pve.proxmox.com/pve-docs/chapter-pve-installation.html)
+covers the base installation. Run commands as root on the node unless labeled otherwise.
 
-**Note:** The kernel build consumes approximately 60 GB under `/root`; allow 80 GB free. It may take
-one to four hours.
+Have console access throughout installation and the first reboot. Use separate data storage
+for encrypted guest disks. An ext4/LVM root keeps storage-encryption recovery separate from
+booting the host. Encrypted root installations are outside this guide's scope.
 
-**Important:** A default installation assigns `/` roughly a quarter of the system disk (the installer's
-[`maxroot`](https://pve.proxmox.com/pve-docs/chapter-pve-installation.html#advanced_lvm_options)) and
-the rest to the `local-lvm` thin pool. Set a larger root at install time, or remove the thin pool and
-extend `/`. The ZFS deployment removes `local-lvm`; the LUKS deployment does not use it.
+This edition covers fresh nodes and new clusters made entirely of wolfSSL-configured nodes.
+Converting an existing production node or manual-build installation in place, mixing stock
+and wolfSSL nodes in one cluster, and removing the integration packages are unsupported.
+Return a node to stock Proxmox by reinstalling it. Guests can be imported onto a freshly
+prepared target using the migration guides.
 
----
+Choose one repository for the installation:
 
-## Version pins
+| Channel | Repository URI | Purpose |
+| --- | --- | --- |
+| FIPS Ready | `https://packages.wolfssl.com/debian` | Evaluation and compatibility testing. This is not a FIPS-validated module. |
+| Licensed FIPS v5 | `https://packages.wolfssl.com/fips-v5/debian` | Licensed wolfCrypt FIPS modules. Obtain access and the applicable module documentation from wolfSSL. |
 
-| Component | Pin |
-|---|---|
-| Proxmox VE | **9.2** (Debian trixie, OpenSSL 3.5) |
-| Kernel | **`proxmox-kernel-7.0.12-1+wolfcrng1-pve`** (pve-kernel commit `85c2f14`) |
-| CRNG kernel patch | In the licensed FIPS source bundle: `linuxkm/patches/7.0/WOLFSSL_LINUXKM_HAVE_GET_RANDOM_CALLBACKS-7v0.patch` |
+Use the same channel on every cluster node. Install the licensed channel directly when it is
+the intended deployment; do not configure both sources together. Confirm the module versions,
+approved services and operating-environment requirements with wolfSSL against the applicable
+Security Policy. Installing these packages does not validate the whole operating system or
+Proxmox deployment.
 
----
+The integration configures management TLS, OpenSSL consumers, SSH, the kernel random-number
+path and the selected storage and backup paths to use wolfCrypt. Guest operating systems are
+unchanged. Virtual TPM cryptography remains outside the wolfCrypt validated boundary.
+Repository signature verification also has exceptions: licensed APT and `pveam` on both
+channels use Sequoia (`sqv`), outside wolfCrypt.
 
-## Deployment requirements
+## 2. Prepare SSH access
 
-### Minimum secret length
+The packaged SSH configuration accepts ECDSA and RSA keys rather than Ed25519. Installing
+OpenSSH restarts the service immediately, before the node reboot. Authorize a suitable key
+for every administrative account and test it in a new connection first.
 
-Use at least **14 characters** for every storage passphrase and backup key password; wolfCrypt FIPS
-module versions differ in whether they reject shorter secrets.
+For example, on the administrator's workstation:
 
-### Administrative SSH key
-
-wolfCrypt FIPS v5 does not provide ed25519 or curve25519. The administrative SSH key must be **ECDSA**
-(P-256, P-384, or P-521) or **RSA**; an ed25519 key causes a lockout when the deployment guides
-restrict `sshd` to FIPS algorithms.
-
-Create the key on the administrative workstation, not the node, and authorize it for the node's
-`root` account:
-
-```bash
-ssh-keygen -t ecdsa -b 384 -f ~/.ssh/id_pve_fips -C "pve-fips-admin"   # run on your workstation
-ssh-copy-id -i ~/.ssh/id_pve_fips.pub root@<node-ip>                   # authorize it on the node
-# Without ssh-copy-id, append the contents of ~/.ssh/id_pve_fips.pub to the node's
-# /root/.ssh/authorized_keys. Use -i ~/.ssh/id_pve_fips for subsequent SSH connections.
+```sh
+ssh-keygen -t ecdsa -b 384 -f ~/.ssh/id_pve_fips
+ssh-copy-id -i ~/.ssh/id_pve_fips.pub root@<node>
+ssh -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -i ~/.ssh/id_pve_fips root@<node> true
 ```
 
-### Kernel FIPS mode
+Keep the console available until this login succeeds again after installation and reboot.
 
-After a successful power-on self-test, the in-kernel `libwolfssl.ko` sets
-`/proc/sys/crypto/fips_enabled` from 0 to 1 even when the node boots with `fips=0`. The deployment
-guides later set `fips=1` on the kernel command line, which additionally enforces FIPS from early
-boot and runs the kernel's own FIPS crypto self-tests.
+## 3. Add the repository and preferences
 
-### Signing keys
+Install the archive keyring:
 
-- **Kernel modules.** The wolfSSL modules must carry a signature the custom kernel trusts.
-- **The kernel image.** A Secure Boot node requires a signed image from §2.6.
+```sh
+curl -fsSLO https://packages.wolfssl.com/keyring/wolfssl-fips-eval-archive-keyring_latest_all.deb
+apt install ./wolfssl-fips-eval-archive-keyring_latest_all.deb
+gpg --show-keys --with-fingerprint /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg
+```
 
-One key, generated on the builder (§2.4), serves both. Retain the private key securely for future
-rebuilds; do not distribute it to deployment nodes.
+The fingerprint must be `FA9A C397 4B00 99D4 15C7 3673 19D1 F0DB 1F30 4C7B`.
+Stop if it differs. Both channels use this archive key; it is separate from the kernel signing
+key enrolled in section 4.
 
-### UEFI Secure Boot
+Create `/etc/apt/sources.list.d/wolfssl-fips-pve.sources`. The example selects FIPS Ready;
+for the licensed channel, replace the URI with the licensed URI in section 1.
 
-These guides use the signed Proxmox GRUB and shim path. Configure and verify that path as described in
-Proxmox's [Secure Boot documentation](https://pve.proxmox.com/pve-docs/chapter-sysadmin.html#sysboot_secure_boot)
-before enrolling a Machine Owner Key (MOK).
+```sh
+cat > /etc/apt/sources.list.d/wolfssl-fips-pve.sources <<'REPO'
+Types: deb
+URIs: https://packages.wolfssl.com/debian
+Suites: pve9
+Components: main
+Signed-By: /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg
+REPO
+```
 
-Check each target node:
+Nodes intended for Ceph also need `ceph-tentacle` on the `Components:` line:
 
-```bash
+```text
+Components: main ceph-tentacle
+```
+
+Install the preference package in its own APT transaction:
+
+```sh
+apt update
+apt install wolfssl-fips-pve-apt
+apt update
+```
+
+**For encrypted ZFS**, use this install command instead of the single-package command above:
+
+```sh
+apt install wolfssl-fips-pve-apt wolfssl-fips-pve-apt-zfs
+```
+
+APT reads preferences when it starts. Complete this separate transaction before installing
+other wolfSSL packages, and do not run a general upgrade between adding the source and
+completing section 5. The preferences select compatible rebuilt packages, including packages
+whose versions sort below their Debian or Proxmox counterparts.
+
+## 4. Enroll the kernel signing key
+
+```sh
 mokutil --sb-state
 ```
 
-For `SecureBoot enabled`, sign the kernel in §2.6 and complete the deployment guide's MOK step.
-For disabled or unsupported Secure Boot, or legacy BIOS, use the unsigned kernel `.deb` from §2.5.
+With Secure Boot disabled, enrollment is unnecessary. With Secure Boot enabled, the node
+must trust the wolfSSL kernel signing key before it can boot the packaged kernel. Secure
+Boot must use the signed shim/GRUB path described in
+[Proxmox boot management](https://pve.proxmox.com/pve-docs/chapter-sysadmin.html#sysboot_secure_boot).
 
-A site using custom firmware `PK`/`KEK`/`db` keys must follow its own policy and Proxmox's
-[custom `db` procedure](https://pve.proxmox.com/wiki/Secure_Boot_Setup#Setup_instructions_for_db_key_variant)
-instead of the MOK step.
+Download the certificate and check its SHA-256 digest:
 
-**Note:** A TPM is not required for this Secure Boot path; TPM measured boot is outside the scope of
-these guides.
-
----
-
-## 1. Prerequisites
-
-### 1.1 A standard Proxmox VE 9.2 node
-
-Use a default Proxmox VE 9.2 installation with network access and a root shell. No guests, storage
-pools, or cluster configuration are required. For installation, follow
-[Installing Proxmox VE](https://pve.proxmox.com/pve-docs/chapter-pve-installation.html)
-([ISO download](https://www.proxmox.com/en/downloads)).
-
-### 1.2 Repositories
-
-Configure the Proxmox VE and Debian repositories per
-[Package Repositories](https://pve.proxmox.com/pve-docs/chapter-sysadmin.html#sysadmin_package_repositories).
-Either the enterprise or no-subscription repository supplies the required packages.
-
-Bring the node current before building:
-
-```bash
-apt update && apt full-upgrade -y
+```sh
+curl -fsSLO https://packages.wolfssl.com/keys/proxmox-kernel/wolfssl-kernel-signing-proxmox-eval.der
+sha256sum wolfssl-kernel-signing-proxmox-eval.der
 ```
 
-### 1.3 Toolchain and Rust
+Expected digest:
 
-Install the build tools and use `rustup stable` for Rust; Trixie's packaged `rustc` is too old for
-the kernel build:
-
-```bash
-apt install -y git build-essential devscripts equivs dh-make flex bison \
-  libelf-dev bc patch autoconf automake libtool pkg-config libssl-dev \
-  dh-python dh-sequence-sphinxdoc curl unzip patchelf quilt
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-. "$HOME/.cargo/env"
-rustup component add rust-src rustfmt clippy
+```text
+4b9e012ec8f6b5ba9f611d9fb685e9e7a35e95eb182e6693bdae6a2570374d25
 ```
 
-### 1.4 wolfSSL FIPS source bundle
+Stop on a mismatch. Enrolling this certificate trusts kernels signed by wolfSSL; confirm the
+fingerprint against the copy supplied by your wolfSSL contact. The certificate's `eval` name
+also applies to the licensed channel.
 
-Obtain the licensed wolfSSL FIPS source bundle from wolfSSL, not a public wolfSSL clone. Copy it
-to the builder and unpack it to `/root/wolfssl-fips-src`:
+Check whether the key is already trusted:
 
-```bash
-# Rename the unpacked directory to the path used throughout these guides:
-cd /root && unzip -q <your-bundle>.zip
-mv wolfssl-*-fips-*/ /root/wolfssl-fips-src   # trailing / — matches the directory, not the .zip
-ls /root/wolfssl-fips-src/wolfcrypt/src/fips.c /root/wolfssl-fips-src/fips-hash.sh   # both must exist
-# Get the kernel patch
-cp /root/wolfssl-fips-src/linuxkm/patches/7.0/WOLFSSL_LINUXKM_HAVE_GET_RANDOM_CALLBACKS-7v0.patch /root/
+```sh
+mokutil --test-key wolfssl-kernel-signing-proxmox-eval.der
 ```
 
----
+Read its output. `is already enrolled` or `is already in db` means no enrollment is needed.
+`is already in the enrollment request` means confirmation is still pending. Do not infer
+trust from the command's exit status.
 
-## 2. The CRNG kernel
+If the key is not trusted or queued, queue it now, choosing a one-time enrollment password:
 
-This kernel differs from stock in four ways:
-
-- FIPS support and self-tests: `CONFIG_CRYPTO_FIPS=y` and `CONFIG_CRYPTO_SELFTESTS=y`.
-- The wolfCrypt CRNG (`get_random_callbacks`) patch.
-- A distinct local version, `+wolfcrng1`, to prevent replacement by a stock kernel.
-- A retained module-signing key (§2.4), required to load the wolfSSL modules with `fips=1`.
-
-**Note:** Every backend (ZFS, LUKS, Ceph) builds this exact kernel. It is pinned to the 7.0.12 line
-because the wolfZFS module requires the OpenZFS 2.4.2 that ships with it.
-
-### 2.1 Fetch kernel sources
-
-```bash
-git clone https://git.proxmox.com/git/pve-kernel.git /root/pve-kernel
-cd /root/pve-kernel
-git checkout 85c2f14                                  # 7.0.12-1 (no tag exists; pin the commit) — all backends
-git -c submodule.fetchJobs=4 submodule update --init --recursive   # full — never --depth 1
-git submodule status   # expect zfsonlinux 069198f9…, ubuntu-kernel d873103e… (gitlinks pinned by 85c2f14)
+```sh
+mokutil --timeout -1
+mokutil --import wolfssl-kernel-signing-proxmox-eval.der
 ```
 
-**Important:** Do not pass `--depth 1` to the submodules: `zfsonlinux` and `ubuntu-kernel` are pinned
-to non-tip commits a shallow fetch can miss, producing an incomplete ZFS tree.
+Do not reboot yet. Confirm the request at the console during section 6. Enrollment is needed
+once per node, not for each kernel update. TPM-sealed boot secrets and third-party DKMS
+modules need additional planning; consult the
+[kernel signing-key guide](https://packages.wolfssl.com/HOWTO-proxmox-kernel-key.md#before-you-start)
+before proceeding if either is used.
 
-### 2.2 Set the local version
+## 5. Install the packages
 
-```bash
-cd /root/pve-kernel
-sed -i 's/^KREL_EXTRA=.*/KREL_EXTRA=+wolfcrng1/' Makefile
-grep -n '^KREL_EXTRA' Makefile          # -> KREL_EXTRA=+wolfcrng1
+Install the metapackage matching the storage selected for this node. Each storage
+metapackage brings in the shared kernel, provider, service configuration and wrappers.
+
+| Storage profile | Install command |
+| --- | --- |
+| Encrypted ZFS | `apt install --allow-downgrades wolfssl-fips-pve-zfs` |
+| LUKS data volumes | `apt install --allow-downgrades wolfssl-fips-pve-luks` |
+| Ceph Tentacle | `apt install --allow-downgrades wolfssl-fips-pve-ceph` |
+| Ceph plus separate local LUKS volumes | `apt install --allow-downgrades wolfssl-fips-pve-ceph wolfssl-fips-pve-luks` |
+| No encrypted data storage yet | `apt install --allow-downgrades proxmox-kernel-wolfcrng wolfssl-fips-pve-config wolfssl-fips-pve-wrappers` |
+
+For Ceph, first complete the stock Tentacle package preparation in the
+[Ceph guide](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md). Do not install the Ceph and
+ZFS metapackages together. For ZFS, confirm both pin packages were installed in section 3.
+
+On every node, also install the compatible backup clients and SSH packages:
+
+```sh
+apt install --allow-downgrades proxmox-backup-client proxmox-backup-file-restore libproxmox-backup-qemu0
+apt install --allow-downgrades openssh-server openssh-client openssh-sftp-server
 ```
 
-**Important:** Set `KREL_EXTRA` before `make build-dir-fresh` (§2.3), which writes the version into
-`debian/control`, `env.mk`, and `EXTRAVERSION`. Changing it afterward produces a mismatched kernel.
+`DOWNGRADING:` messages are expected for compatible rebuilds selected by the preferences.
+Review the transaction; do not accept removal of the integration or the intended storage
+packages. Keep the local `sshd_config` if prompted.
 
-### 2.3 Generate the build tree, apply the CRNG patch, enable FIPS
+The packages configure the provider and service settings automatically. They also install
+compatible Proxmox authentication and supporting library packages. Do not add the old
+manual-build wrappers or provider configuration on top of them.
 
-```bash
-cd /root/pve-kernel
-. "$HOME/.cargo/env"                     # restore Rust on PATH in a fresh shell
-make build-dir-fresh
-BD=$(ls -d /root/pve-kernel/proxmox-kernel-*/ | head -1); BD=${BD%/}
-KSRC="$BD/ubuntu-kernel"                 # build tree for this guide and the backend build, not the submodule
-# Save paths and the Rust environment for later build stages and new sessions.
-printf 'BD=%q\nKSRC=%q\n. "$HOME/.cargo/env"\n' "$BD" "$KSRC" > /root/wolf-buildenv.sh
-echo "build dir=$BD  KSRC=$KSRC"
+Open a fresh SSH connection with the key from section 2. If the node previously advertised
+an Ed25519 host key, verify its ECDSA or RSA host-key fingerprint at the console before
+accepting the changed key on the workstation. For the ECDSA fingerprint:
 
-# CRNG patch — in the build tree:
-cd "$KSRC"
-patch -p1 < /root/WOLFSSL_LINUXKM_HAVE_GET_RANDOM_CALLBACKS-7v0.patch
-grep -c WOLFSSL_LINUXKM_HAVE_GET_RANDOM_CALLBACKS drivers/char/random.c   # -> 9
-
-# Use config fragments: the packaged build regenerates .config and ignores `make menuconfig` changes.
-cd "$BD"
-printf '\n-e CONFIG_CRYPTO_FIPS\n-e CONFIG_CRYPTO_SELFTESTS\n' >> debian/rules.d/config-common.opts
-tail -2 debian/rules.d/config-common.opts
+```sh
+ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
 ```
 
-**Note:** While the build tree is generated, `build-dir-fresh` reports `dpkg-buildapi: error: cannot
-read debian/control` and `/bin/sh: 1: test: Illegal number:`, twice. The step completes; no action is
-required.
+## 6. Reboot and verify
 
-### 2.4 Pin a persistent module-signing key
-
-The pve-kernel build deletes its generated signing key. Create one outside the build tree and use
-its **absolute path** so it remains available to sign the wolfSSL modules. The build embeds its
-certificate in the kernel; modules signed with this key are trusted with or without Secure Boot:
-
-```bash
-source /root/wolf-buildenv.sh
-cat > /root/kernel-signing.genkey <<'GK'
-[ req ]
-default_bits = 4096
-distinguished_name = req_dn
-prompt = no
-string_mask = utf8only
-x509_extensions = ext
-[ req_dn ]
-CN = Proxmox wolfCrypt-FIPS module signing key
-[ ext ]
-basicConstraints=critical,CA:FALSE
-keyUsage=digitalSignature
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid
-GK
-openssl req -new -nodes -utf8 -sha256 -days 3650 -batch -x509 \
-    -config /root/kernel-signing.genkey -outform PEM -out /root/ksk-cert.pem -keyout /root/ksk-priv.pem
-cat /root/ksk-priv.pem /root/ksk-cert.pem > /root/kernel-signing-key.pem   # PEM: private key + cert
-openssl x509 -in /root/ksk-cert.pem -outform DER -out /root/kernel-signing-key.x509
-chmod 600 /root/kernel-signing-key.pem; rm -f /root/ksk-priv.pem /root/ksk-cert.pem
-# Set the absolute key path in the build's config fragment:
-echo '--set-str CONFIG_MODULE_SIG_KEY /root/kernel-signing-key.pem' >> "$BD/debian/rules.d/config-common.opts"
-# Seed certs/signing_key.pem: the build needs it for module signing and to derive signing_key.x509,
-# but does not generate it when CONFIG_MODULE_SIG_KEY points to an external key.
-cp /root/kernel-signing-key.pem "$KSRC/certs/signing_key.pem"
-# Allow post-sign cleanup when the copy is absent:
-sed -i 's#rm \./ubuntu-kernel/certs/signing_key\.pem#rm -f ./ubuntu-kernel/certs/signing_key.pem#' "$BD/debian/rules"
-echo "signing key staged: certs/signing_key.pem = your key, protected from regeneration"
+```sh
+reboot
 ```
 
-### 2.5 Build the kernel `.deb`
+If a signing-key request is queued, attend the console. In **Perform MOK management**, select
+**Enroll MOK**, view the key and confirm its subject is
+`wolfSSL Proxmox VE Kernel Signing (eval)`. The displayed SHA-1 fingerprint is:
 
-```bash
-source /root/wolf-buildenv.sh            # restore paths and Rust environment
-cd /root/pve-kernel
-mk-build-deps -i -r -t "apt-get -y" "$BD/debian/control"
-cd "$BD"
-dpkg-buildpackage -b -uc -us
-# Packages: /root/pve-kernel/. The retained key stays at /root/kernel-signing-key.pem.
+```text
+28 78 AC E2 7B DD 8D 2D 12 A9 10 90 21 F1 BE 90 3F 04 39 34
 ```
 
-**Important:** This build stops at `make[1]: *** [debian/rules:266: fwcheck] Error 1`. Remove the stale
-check file and resume without cleaning:
+Select **Continue**, **Yes**, enter the one-time password, and select **Reboot**. Complete
+confirmation promptly; firmware may restart the node while the menu waits. If enrollment is
+missed and the kernel fails with `bad shim signature`, boot a stock Proxmox kernel from the
+advanced boot menu, queue the key again, and retry at the console.
 
-```bash
-source /root/wolf-buildenv.sh
-cd "$BD"
-rm "$BD/fwlist-previous-amd64"
-dpkg-buildpackage -b -uc -us -nc
+After boot, reconnect and check:
+
+```sh
+uname -r
+cat /proc/sys/crypto/fips_enabled
+systemctl is-active pve-guests
+wolfssl-fips-pve-verify --login
 ```
 
-If instead a config or a patch was changed, re-run `make build-dir-fresh` (§2.3) and re-apply
-§2.3–§2.4 before rebuilding: `debian/rules clean` is a no-op here, and a bare `dpkg-buildpackage`
-re-run skips compilation and silently repackages the stale build.
+The running kernel must contain `+wolfcrng`, and `fips_enabled` must be `1`.
+Wait for `pve-guests` to become `active` before running the verifier. With `--login`, the
+verifier prompts for the root password and checks management login as well as configuration.
+Require the kernel, wolfCrypt/provider, SSH and management-login checks to pass. Before
+encrypted storage is created, expect failures for missing storage or unlock configuration,
+unset encrypted container-backup staging, and guest, backup or import content enabled on
+installer-created storage. Resolve all other `FAIL` results before continuing. Complete the
+selected storage guide, then repeat verification and resolve those deferred failures.
+Cluster checks follow cluster configuration.
+On Ceph-prepared nodes, the no-running-Ceph-daemon check is expected until the new Ceph cluster
+is initialized; repeat verification afterward.
 
-Verify the signing key, FIPS configuration, package version, and module contents:
+## 7. Configure storage and operations
 
-```bash
-grep '^CONFIG_MODULE_SIG_KEY=' "$KSRC/.config"      # -> "/root/kernel-signing-key.pem", not certs/…
-grep '^CONFIG_CRYPTO_FIPS='   "$KSRC/.config"       # -> =y
-openssl x509 -in /root/kernel-signing-key.x509 -noout -ext subjectKeyIdentifier
-#   ^ the key the installed kernel trusts in .builtin_trusted_keys
-ls /root/pve-kernel/*.deb | grep wolfcrng1
-dpkg-deb -f /root/pve-kernel/proxmox-kernel-*+wolfcrng1-pve_*.deb Package
-dpkg-deb -c /root/pve-kernel/proxmox-kernel-*+wolfcrng1-pve_*.deb | grep -c lib/modules/   # -> big number; no error = clean
-```
+The first reboot activates the selected profile. Continue with its guide to create encrypted
+storage and configure unlock or cluster services:
 
-### 2.6 Sign the kernel image for Secure Boot
+- [ZFS native encryption](../storage-cluster/WOLFSSL-PROXMOX-FIPS-DEPLOYMENT-ZFS.md).
+- [LUKS/dm-crypt](../storage-cluster/WOLFSSL-PROXMOX-FIPS-DEPLOYMENT-LUKS.md).
+- [Ceph](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md), after forming the new cluster.
 
-For Secure Boot deployments, sign the image inside the `.deb` on the builder. Do not install the
-node-side signing hook from Proxmox's
-[custom-kernel procedure](https://pve.proxmox.com/wiki/Secure_Boot_Setup#Signing_a_custom_kernel).
+The installer-created `local`, `local-lvm` or `local-zfs` storage is not made encrypted by
+installing the common packages. Keep guest data and backups on the encrypted destinations
+configured in the selected guide.
 
-```bash
-apt-get install -y sbsigntool
-source /root/wolf-buildenv.sh
-V=7.0.12-1+wolfcrng1-pve
-# Convert the §2.4 DER certificate to PEM for sbsign:
-openssl x509 -inform DER -in /root/kernel-signing-key.x509 -out /root/kernel-signing-key.crt
-# unpack the kernel .deb, sign the image in place, and repack:
-rm -rf /root/signdeb && mkdir -p /root/signed-debs
-dpkg-deb -R /root/pve-kernel/proxmox-kernel-${V}_*.deb /root/signdeb
-sbsign --key /root/kernel-signing-key.pem --cert /root/kernel-signing-key.crt \
-       --output /root/signdeb/boot/vmlinuz-$V.signed /root/signdeb/boot/vmlinuz-$V
-mv /root/signdeb/boot/vmlinuz-$V.signed /root/signdeb/boot/vmlinuz-$V
-# Refresh the signed kernel's checksum; otherwise debsums reports it as modified on every node.
-cd /root/signdeb
-grep -v " boot/vmlinuz-$V\$" DEBIAN/md5sums > /tmp/md5sums.new
-md5sum boot/vmlinuz-$V >> /tmp/md5sums.new
-mv /tmp/md5sums.new DEBIAN/md5sums
-cd /
-dpkg-deb -b /root/signdeb /root/signed-debs/
-```
+When creating or importing VMs, use standard VGA/noVNC or another supported display.
+SPICE/QXL display, SPICE audio and SPICE USB redirection are unsupported; the verifier
+identifies affected VM settings and supplies their removal commands.
 
-Confirm the image is signed by the retained key:
-
-```bash
-sbverify --cert /root/kernel-signing-key.crt /root/signdeb/boot/vmlinuz-$V
-#   -> Signature verification OK
-# --cert rejects an unsigned image or a different certificate.
-# --list can exit 0 for an unsigned image; check the output, not just the exit status:
-sbverify --list /root/signdeb/boot/vmlinuz-$V
-#   -> signature 1
-#   -> image signature issuers:
-#   ->  - /CN=<the subject of the §2.4 certificate>
-ls -l /root/signed-debs/                               # the signed kernel .deb
-```
-
-Distribute the signed `.deb`, the unchanged headers package, and the public certificate
-`/root/kernel-signing-key.x509`. Keep `/root/kernel-signing-key.pem` on the builder.
-
-For MOK replacement or revocation, follow Proxmox's
-[Secure Boot documentation](https://pve.proxmox.com/wiki/Secure_Boot_Setup).
-
----
-
-## 3. Build wolfSSL and wolfProvider
-
-Build the FIPS `libwolfssl.so` first, then wolfProvider against it and the **system** OpenSSL to
-match the ABI used by Proxmox services:
-
-```bash
-# Clone before installing wolfSSL under /opt/wolfProvider/wolfssl-install to avoid a directory conflict:
-cd /opt
-git clone https://github.com/wolfSSL/wolfProvider.git
-cd wolfProvider && git checkout v1.2.1
-
-# Use your licensed bundle's FIPS configuration (e.g. ready or v5.2.4) for <your-bundle-config>.
-# wolfProvider requires --enable-opensslcoexist and both -D flags.
-# -DWOLFSSL_OLD_OID_SUM sets the OID scheme checked in §3.1.
-cd /root/wolfssl-fips-src
-./configure --prefix=/opt/wolfProvider/wolfssl-install --enable-fips=<your-bundle-config> \
-    --enable-opensslcoexist CFLAGS="-DWOLFSSL_OLD_OID_SUM -DWOLFSSL_DH_EXTRA"
-make -j"$(nproc)"
-./fips-hash.sh                  # set the required in-core FIPS integrity hash
-make -j"$(nproc)" && make install
-
-# Build wolfProvider against system OpenSSL (/usr) and the FIPS wolfSSL:
-cd /opt/wolfProvider
-./autogen.sh
-./configure --with-openssl=/usr --with-wolfssl=/opt/wolfProvider/wolfssl-install \
-    CFLAGS="-DWOLFSSL_OLD_OID_SUM -DWOLFSSL_DH_EXTRA"
-make -j"$(nproc)"
-```
-
-Install both libraries in system paths so services can load them without shell environment variables:
-
-```bash
-# Install the provider at the path used by the deployment guides:
-install -Dm755 /opt/wolfProvider/.libs/libwolfprov.so \
-               /usr/lib/x86_64-linux-gnu/ossl-modules/libwolfprov.so
-# First install: cp -a is safe. For later replacement on a running system, use install/mv instead.
-cp -a /opt/wolfProvider/wolfssl-install/lib/libwolfssl.so* /usr/local/lib/
-ldconfig
-# Remove the build-tree RUNPATH so libwolfssl resolves from /usr/local/lib even if /opt is deleted:
-patchelf --remove-rpath /usr/lib/x86_64-linux-gnu/ossl-modules/libwolfprov.so
-```
-
-Verify the module resolves under `/usr/local/lib` with no shell environment variables:
-
-```bash
-env -i LD_LIBRARY_PATH= ldd /usr/lib/x86_64-linux-gnu/ossl-modules/libwolfprov.so | grep -F /usr/local/lib
-```
-
-### 3.1 Verify wolfProvider
-
-The power-on self-test (POST) detects a mismatched FIPS bundle configuration.
-
-```bash
-cat > /tmp/wp.cnf <<'EOF'
-openssl_conf = openssl_init
-[openssl_init]
-providers = provider_sect
-[provider_sect]
-wolfprov = wolfprov_sect
-[wolfprov_sect]
-module = /usr/lib/x86_64-linux-gnu/ossl-modules/libwolfprov.so
-activate = 1
-EOF
-export OPENSSL_CONF=/tmp/wp.cnf
-openssl list -providers | grep -A2 -i wolf      # -> "wolfSSL Provider FIPS ... status: active"  (POST passed)
-echo hello | openssl dgst -sha256               # digest works
-openssl genrsa -out /tmp/wp.key 2048 && openssl pkey -in /tmp/wp.key -noout && echo "RSA OK (OID scheme)"
-# SHA-1 signing must fail:
-openssl dgst -sha1 -sign /tmp/wp.key /tmp/wp.cnf >/dev/null 2>&1 && echo "FAIL: SHA-1 allowed" || echo "SHA-1 blocked (FIPS OK)"
-unset OPENSSL_CONF; rm -f /tmp/wp.key /tmp/wp.cnf
-```
-
-### 3.2 Configure wolfProvider
-
-Installation alone does not route a process through wolfProvider. Set its `OPENSSL_CONF` to the
-file below. The deployment guides apply this setting through systemd drop-ins or on the command line.
-
-```bash
-mkdir -p /etc/wolfprovider
-cat > /etc/wolfprovider/openssl.cnf <<'EOF'
-openssl_conf = openssl_init
-[openssl_init]
-providers = provider_sect
-alg_section = algorithm_sect
-ssl_conf = ssl_sect
-[provider_sect]
-wolfprov = wolfprov_sect
-[wolfprov_sect]
-module = /usr/lib/x86_64-linux-gnu/ossl-modules/libwolfprov.so
-activate = 1
-[algorithm_sect]
-default_properties = provider=wolfprov
-[ssl_sect]
-system_default = system_default_sect
-[system_default_sect]
-# Pin NIST curves: X25519 is not an approved KAS and FIPS clients fail its keyshare.
-Groups = P-256:P-384:P-521
-# Pin AES-GCM server-side: the provider advertises non-approved ChaCha20-Poly1305
-# and will serve it if offered.
-CipherSuites = TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256
-EOF
-OPENSSL_CONF=/etc/wolfprovider/openssl.cnf openssl list -providers | grep -qi 'wolfSSL Provider FIPS' \
-  && echo "wolfProvider routing configuration OK"
-```
-
-**Important:** Keep `default_properties = provider=wolfprov` mandatory: do not add `?`. This prevents
-fallback to the default provider, including explicit in-code fetches.
-
----
-
-## Continue in a deployment guide
-
-The builder now holds the shared artifacts:
-
-```
-libwolfssl.so* + libwolfprov.so                    (the userspace FIPS matched pair — §3)
-/etc/wolfprovider/openssl.cnf                      (the wolfProvider routing configuration — §3.2)
-proxmox-kernel-7.0.12-1+wolfcrng1-pve_*.deb        (the CRNG FIPS kernel — §2)
-proxmox-headers-7.0.12-1+wolfcrng1-pve_*.deb       (matching headers — §2)
-/root/kernel-signing-key.pem  (+ .x509)            (the retained signing key and public certificate)
-```
-
-Keep the private key on the builder and distribute only the files the deployment guide identifies. For
-Secure Boot, the signed kernel from §2.6 replaces the kernel `.deb` above:
-
-```
-/root/signed-debs/proxmox-kernel-7.0.12-1+wolfcrng1-pve_*.deb   (the signed CRNG FIPS kernel — §2.6)
-/root/kernel-signing-key.x509                                   (the certificate enrolled on each node)
-```
-
-Retain the kernel **build tree** (`$BD` / `$KSRC`) and the unpacked FIPS source at
-`/root/wolfssl-fips-src`; the backend build compiles its in-kernel `libwolfssl.ko` from that source
-against that tree.
-
-**Continue in the deployment guide for your storage architecture** — Ceph (distributed / shared
-storage), or single-node **ZFS** or **LUKS** — then the **Node Configuration and Recovery** and
-**Backup** guides.
+Complete [Backup](../_shared/WOLFSSL-PROXMOX-FIPS-BACKUP.md) before relying on the deployment.
+Use [Node maintenance and recovery](../_shared/WOLFSSL-PROXMOX-FIPS-NODE-CONFIGURATION.md)
+for subsequent updates and access recovery.

@@ -4,10 +4,10 @@ These patches target the Ceph source used by Proxmox Ceph **20.2.2-pve1**, packa
 `06f6a7ab7187f570d9fc04b7ac9664f1fb6b84b0` in
 [Proxmox's Ceph repository](https://git.proxmox.com/?p=ceph.git;a=summary).
 
-Apply them in numeric order as described in
-[Ceph Deployment §5.1](../../docs/ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md#51-ceph-packages).
-The deployment guide also describes how to copy the patches to the builder, build the packages,
-and verify their contents.
+These source patches belong to the previous manual-build edition. The current
+[Ceph Deployment guide](../../docs/ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md) uses prebuilt APT
+packages and does not require applying them. Refer to repository history for the previous
+source-build procedure. Patch contents, licensing and attribution are retained below.
 
 | Patch | Upstream file |
 | --- | --- |

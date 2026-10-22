@@ -1,210 +1,192 @@
-# wolfSSL FIPS on Proxmox VE — Backup
+# wolfSSL FIPS for Proxmox VE — Backup and Restore
 
-Configure and verify backups after completing your storage deployment and Node Configuration and
-Recovery guides. For guests and archives from a previous deployment, use the migration guides.
+Complete [Installation](../_foundation/WOLFSSL-PROXMOX-FIPS-FOUNDATION.md) and the selected
+storage guide on every backup and restore node first. Installation supplies the rebuilt PBS
+clients and their wrappers. Commands run as root on the Proxmox node unless labeled otherwise.
+For scheduling, retention, guest consistency and backup exclusions, use the official
+[Proxmox Backup and Restore chapter](https://pve.proxmox.com/pve-docs/chapter-vzdump.html).
 
----
+## 1. Choose the protection for backups
 
-## 1. Backup encryption
-
-For standard `vzdump` procedures, see the [Backup and Restore](https://pve.proxmox.com/pve-docs/chapter-vzdump.html)
-chapter of the Proxmox VE Administration Guide.
-
-| Path | Archive encryption |
+| Destination | Protection supplied by this deployment |
 | --- | --- |
-| `vzdump` to file-level storage | Depends on the target storage. `vzdump` performs no cryptography of its own. |
-| Proxmox Backup Server (PBS) | Depends on the datastore's storage, plus client-side chunk encryption when a key is configured (§3). |
+| File-level storage (`vzdump` VMA or tar archive) | Encryption of the destination filesystem or block device. The archive itself is not encrypted by `vzdump`. Copying it outside that storage removes this protection. |
+| PBS with a client encryption key | Client-side AES-256-GCM encryption of backup data before upload. The rebuilt clients also route chunk SHA-256 operations through wolfProvider. |
+| PBS without a client encryption key | No client-side encryption; any at-rest protection depends on the server's datastore storage. |
 
-**Important:** An encrypted source does not protect an archive written to an unencrypted target.
-Backup output does not warn about this loss of at-rest protection.
+An encrypted source disk does not encrypt its backup automatically. PBS client encryption
+does not cover all backup metadata or local staging. PBS server-side verification and the
+server's underlying storage are separate from the Proxmox VE client configuration described here.
 
----
+## 2. Protect the destination and temporary files
 
-## 2. Verify the target and restore
+Check each job's target, any `dumpdir` override and the default settings:
 
-The deployment guides do not create backup storage. Check the target's encryption separately from
-the source storage.
-
-**Caution:** `local` is unencrypted and accepts backups unless excluded by its content types. It may
-be the only target offered by `vzdump` or the web interface. The ZFS/LUKS guides restrict it to
-`vztmpl,iso`; the Ceph guide does not. Check available backup storages and each job's target before
-use, not only when creating the job.
-
-```bash
-pvesm status --content backup                  # -> the storages that accept backups
+```sh
+pvesm status --content backup
+pvesh get /cluster/backup --output-format json-pretty
+cat /etc/vzdump.conf
 ```
 
-Back up and restore a guest, then verify a file checksum. Use the deployment guide's verification
-container or a guest with an operating system and data. The guide's verification VM has an empty disk.
+Keep file archives on a destination whose encryption and unlock behavior have been verified
+using the selected storage guide. Do not use the unencrypted `local` directory for backups.
+The verifier does not inspect every job's `dumpdir`; such an override can bypass the selected
+storage. Restrict storage content types and correct jobs before running them.
 
-**Inside the source guest**, record a representative file's checksum:
+For a directory destination, configure its actual encrypted mount as a prerequisite. Replace
+`<backup-storage>` with the storage ID and `<encrypted-mount>` with its mounted filesystem:
 
-```bash
-#   sha256sum <a representative file> > /root/pre-backup.sha256
+```sh
+pvesm set <backup-storage> --is_mountpoint <encrypted-mount>
+findmnt --mountpoint <encrypted-mount>
 ```
 
-**On the Proxmox node**, back up the guest and identify the newest archive:
+Confirm that the displayed source is the intended encrypted dataset or mapping. The storage
+flag is an additional check; verify the live backing mount before each backup or restore.
+Do not create directories or write data beneath an absent encrypted mount.
 
-```bash
-vzdump <vmid> --storage <target> --mode snapshot
-pvesm list <target> --vmid <vmid> | awk '/backup/{print $1}' | sort | tail -1    # -> the newest volid
+Container backups can stage plaintext files locally, including when the final target is PBS.
+Use an encrypted filesystem for `tmpdir` on every node that runs these jobs. With that
+filesystem already unlocked and mounted:
+
+```sh
+mountpoint -q <encrypted-mount> && install -d -m 1777 <encrypted-mount>/backup-tmp
 ```
 
-Restore with the commands for the guest type below.
+Set the existing `tmpdir` entry in `/etc/vzdump.conf`, or add it if absent:
 
-**Virtual machine:**
-
-```bash
-qmrestore "<volid>" <new-vmid> --storage <guest-storage>
-qm start <new-vmid> && sleep 5 && qm status <new-vmid>     # -> status: running
+```text
+tmpdir: <encrypted-mount>/backup-tmp
 ```
 
-**Container:** Use `pct restore`, not `qmrestore`; the wrong command leaves a VM configuration
-stub (§4).
+Mode `1777` permits unprivileged-container backup staging. Reserve capacity for both the
+archive and any container staging copy. Check the configured location before starting jobs:
 
-```bash
-pct restore <new-ctid> "<volid>" --storage <guest-storage>
-pct start <new-ctid> && sleep 5 && pct status <new-ctid>   # -> status: running
+```sh
+grep '^tmpdir:' /etc/vzdump.conf
+findmnt -T <encrypted-mount>/backup-tmp
 ```
 
-**Inside the restored guest**, verify the checksum:
+Require the intended encrypted source, not the root filesystem. Apply the backend guide's
+boot/unlock dependencies and ensure the mount is available before scheduled backups run.
+Moving the setting does not remove plaintext left by earlier backups.
 
-```bash
-#   sha256sum -c /root/pre-backup.sha256       # -> OK
+## 3. Configure PBS encryption and retain its keys
+
+### 3.1 Proxmox VE storage keys
+
+Use an existing PBS datastore and account authorized for the required backup and restore
+operations. Obtain the server certificate fingerprint through a trusted channel. Replace
+`<pbs-storage>`, `<pbs-host>`, `<datastore>`, `<user@realm>` and `<fingerprint>` below with
+those values. The final `--password` prompts interactively:
+
+```sh
+pvesm add pbs <pbs-storage> --server <pbs-host> --datastore <datastore> \
+  --username <user@realm> --fingerprint <fingerprint> --encryption-key autogen --password
 ```
 
-**On the Proxmox node**, remove only the test guest you restored, using the matching command:
+`autogen` creates a key without a passphrase, as required by unattended Proxmox VE jobs.
+A passphrase-protected storage key cannot be opened by those jobs even though `pvesm` accepts
+it. See [PBS storage configuration](https://pve.proxmox.com/pve-docs/pvesm.1.html#storage_pbs)
+for account and datastore options.
 
-```bash
-qm stop <new-vmid> && qm destroy <new-vmid> --purge        # VM test guest
-pct stop <new-ctid> && pct destroy <new-ctid> --purge      # container test guest
+**Warning:** Preserve `/etc/pve/priv/storage/<pbs-storage>.enc` in protected storage outside
+the cluster immediately. The server cannot recover encrypted data without the corresponding
+client key. Removing the storage definition deletes this file; joining a node to a cluster
+replaces its local storage keys with the cluster's keys.
+
+Verify the off-cluster copy and retain each old key while backups encrypted with it remain.
+Test recovery with that retained key, including on a replacement node. For an existing
+backup set, import its original key when configuring storage; generating a new key cannot
+recover old data:
+
+```sh
+pvesm set <pbs-storage> --encryption-key <protected-original-key-file>
 ```
 
----
+### 3.2 Standalone backup-client keys
 
-## 3. Proxmox Backup Server
+For direct `proxmox-backup-client` backups, a key file may be protected by an interactive
+passphrase. Create it with PBKDF2 and a passphrase of at least **14 bytes**; non-ASCII
+characters can occupy multiple bytes:
 
-For Proxmox Backup Server installation and datastore administration, see the
-[Proxmox Backup Server documentation](https://pbs.proxmox.com/docs/).
-
-With an encryption key configured, the client encrypts chunks with AES-256-GCM before sending them
-from the Proxmox VE node.
-
-**Important:** Complete Node Configuration and Recovery guide §2 on every node before adding a
-PBS target.
-
-### 3.1 Configure the backup client
-
-Container and host backups use `/usr/bin/proxmox-backup-client`. Install a wrapper on **every node**
-to select wolfProvider regardless of the parent process's environment:
-
-```bash
-# Save the packaged binary only if it has not already been wrapped:
-if [ "$(head -c2 /usr/bin/proxmox-backup-client)" != '#!' ]; then
-  cp -a /usr/bin/proxmox-backup-client /usr/bin/proxmox-backup-client.real
-fi
-cat > /usr/bin/proxmox-backup-client <<'EOF'
-#!/bin/bash
-export OPENSSL_CONF=/etc/wolfprovider/openssl.cnf
-exec -a "$0" /usr/bin/proxmox-backup-client.real "$@"
-EOF
-chmod +x /usr/bin/proxmox-backup-client
+```sh
+proxmox-backup-client key create <protected-key-file> --kdf pbkdf2
 ```
 
-**Important:** Unpacking `proxmox-backup-client` replaces the wrapper. Hold it and the other packages
-used for backup cryptography:
+The default scrypt KDF is unsupported by wolfProvider. Existing scrypt keys must be
+re-protected with PBKDF2 using a stock client on a separate system before use on these nodes;
+retain the same encryption key so existing backups remain recoverable. The licensed library
+also limits PBKDF2 to 10,000,000 iterations.
 
-```bash
-apt-mark hold proxmox-backup-client proxmox-backup-file-restore libproxmox-backup-qemu0
+PBS master-key recovery uses RSA operations outside the wolfCrypt validated boundary.
+If used under your recovery policy, specify `--kdf pbkdf2` when importing the recovered key,
+and use a passphrase of at least 14 bytes. The
+[PBS client documentation](https://pbs.proxmox.com/docs/backup-client.html#using-a-master-key-to-store-and-recover-encryption-keys)
+covers the master-key procedure. Retain a protected off-cluster copy of standalone keys too.
+
+## 4. Test backup and restore
+
+Run this round trip for each guest type and destination used in production. Use guests with
+an operating system and known data. Choose unused restore IDs and an isolated test network
+before starting copies, to avoid duplicate guest identities. Confirm the restore storage and
+staging mount are unlocked and encrypted as in section 2.
+
+Inside each source guest, record a representative file's SHA-256 digest and retain a copy
+outside the guest for comparison:
+
+```sh
+sha256sum <known-file>
 ```
 
-**Caution:** Holds do not prevent reinstallation. `apt-get install --reinstall` replaces the wrapper
-and clears the hold without warning. After package operations affecting these three packages,
-reapply the wrapper and hold, then run §3.3.
+On the node, replace `<vmid>` and `<ctid>` with the source IDs and `<backup-storage>` with
+the file-level or encrypted PBS destination:
 
-For single-file restore, repeat the wrapper procedure with `proxmox-file-restore` in place of
-`proxmox-backup-client`. It connects directly to PBS and requires `PBS_FINGERPRINT` to be exported;
-otherwise it fails with `certificate validation failed`. Verify the wrapper and run the binary:
-
-```bash
-head -c2 /usr/bin/proxmox-file-restore; echo             # -> #!
-grep -q wolfprovider /usr/bin/proxmox-file-restore && echo "OK: file-restore scoped"
-# Run it to detect a missing wrapper target. Use help; this binary has no version subcommand.
-proxmox-file-restore help >/dev/null && echo "OK: file-restore runs"
+```sh
+vzdump <vmid> <ctid> --storage <backup-storage> --mode snapshot
+pvesm list <backup-storage> --vmid <vmid>
+pvesm list <backup-storage> --vmid <ctid>
 ```
 
-**Important:** The backup-client wrapper covers containers and hosts, not VMs. VM backups use
-`libproxmox-backup-qemu` in QEMU; VM restores use `/usr/bin/pbs-restore`. Apply and verify their
-wrappers in Node Configuration and Recovery guide §2.
+Require successful jobs. For PBS, also confirm the job log identifies encryption. Select
+the exact volume IDs created by this run; do not select an older backup merely because it
+appears in the list. Container snapshot support depends on the source backend; staging may
+be needed if the job falls back to suspend mode.
 
-### 3.2 Encryption keys
+Restore the VM and container with their respective tools. Replace `<vm-backup-volume-id>`
+and `<ct-backup-volume-id>` with those IDs, and `<guest-storage>` with the verified encrypted
+restore destination:
 
-Direct host/container backups with `proxmox-backup-client` use a key file that may have a passphrase.
-Guest backups and scheduled jobs use the key in their Proxmox VE storage configuration. These key
-models are not interchangeable.
-
-Create passphrase-protected key files with `--kdf pbkdf2`:
-
-```bash
-proxmox-backup-client key create <keyfile> --kdf pbkdf2
+```sh
+qmrestore '<vm-backup-volume-id>' <new-vmid> --storage <guest-storage> --unique 1
+pct restore <new-ctid> '<ct-backup-volume-id>' --storage <guest-storage>
+qm config <new-vmid>
+pct config <new-ctid>
 ```
 
-**Important:** wolfProvider does not support the default KDF, scrypt. Creating or opening a scrypt
-key fails without fallback, including during restore.
+Check all restored disks and container mount points against the intended storage and the
+backup's contents. After isolating the restored guests' networking, start them:
 
-For Proxmox VE storage, generate the key when adding the datastore:
-
-```bash
-pvesm add pbs <id> --server <host> --datastore <datastore> \
-  --username <user>@<realm> --password <password> \
-  --fingerprint <fingerprint> --encryption-key autogen
+```sh
+qm start <new-vmid>
+pct start <new-ctid>
 ```
 
-**Important:** Storage keys must not have a passphrase. Unattended jobs cannot prompt for one and
-fail without writing a backup (§4).
+Inside each restored guest, repeat `sha256sum <known-file>` and compare it with the externally
+retained digest. Confirm the guest boots and its required application data is present.
+A successful task alone does not establish a usable restore. Preserve the tested key and
+backup until the recovery requirements are satisfied.
 
-**Warning:** Copy the [client-side key](https://pbs.proxmox.com/docs/backup-client.html) outside the
-cluster immediately. Losing it makes every backup encrypted with it unrestorable.
+## 5. Diagnose encryption failures
 
-**Important:** When recovering with a
-[master key](https://pbs.proxmox.com/docs/backup-client.html#using-a-master-key-to-store-and-recover-encryption-keys),
-pass `--kdf pbkdf2` to `key import-with-master-key`. It encrypts the recovered key under a new
-passphrase and otherwise defaults to scrypt, regardless of the original key's KDF.
+If a PBS job reports `failed to load decryption key` or `no password input mechanism available`,
+check whether its storage key has a passphrase. Supply the original key without passphrase
+protection; keep the original key and all copies until restoration is verified. Do not replace
+it with a newly generated key to repair access to existing backups.
 
-### 3.3 Verify the client
+`Algorithm (SCRYPT : 0)` indicates an incompatible key KDF; use section 3.2. The client's
+benchmark also tests scrypt and is not an acceptance check for this deployment.
 
-```bash
-# Check the wrapper:
-head -c2 /usr/bin/proxmox-backup-client; echo  # -> #!
-grep -q wolfprovider /usr/bin/proxmox-backup-client && echo "OK: client scoped"
-# Run it to confirm the wrapper's target exists and works:
-proxmox-backup-client version                  # -> client version: <version>
-# Confirm all three package holds:
-apt-mark showhold | grep -c 'proxmox-backup-client\|proxmox-backup-file-restore\|libproxmox-backup-qemu0'   # -> 3
-```
-
-Then run the §2 round trip against the Proxmox Backup Server storage.
-
----
-
-## 4. Troubleshooting
-
-**`vzdump --mode stop` fails with `VM quit/powerdown failed - got timeout`.** A guest without an OS,
-including the deployment guide's verification VM, cannot acknowledge the ACPI shutdown. The backup
-times out after ten minutes without writing an archive. Use `--mode snapshot`.
-
-**`vzdump --mode stop` is refused with `Cannot execute a backup with stop mode on a HA managed and
-enabled Service`.** The Ceph deployment places its guests under high availability. Back them up with
-`--mode snapshot`.
-
-**`qmrestore` refuses a container archive with `got unexpected backup format 'pbs-ct'`.** It leaves a
-VM configuration that blocks `pct restore` with `VM <new-ctid> already exists`. Remove that stub with
-`qm destroy <new-ctid> --purge`, then use `pct restore`.
-
-**An unattended backup cannot load the storage key.** A VM reports
-`failed to load decryption key from "/etc/pve/priv/storage/<id>.enc"`; a container reports `no password
-input mechanism available`. The key has a passphrase, so both jobs fail without writing a backup.
-Replace it with a key without a passphrase (`--encryption-key autogen`, §3.2).
-
-**`proxmox-backup-client benchmark` reports a scrypt error.** The benchmark tests scrypt, which
-wolfProvider does not support.
+For provider or wrapper failures, use
+[Node Maintenance and Recovery](WOLFSSL-PROXMOX-FIPS-NODE-CONFIGURATION.md).
+After recovery, fully stop and start affected VMs and repeat the backup/restore round trip.
