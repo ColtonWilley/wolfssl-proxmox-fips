@@ -66,17 +66,27 @@ Keep the console available until this login succeeds again after installation an
 
 ## 3. Add the repository and preferences
 
-Install the archive keyring:
+Download the archive-key package and extract only its public key. Do not install the downloaded
+package or extract its filesystem onto the node:
 
 ```sh
 curl -fsSLO https://packages.wolfssl.com/keyring/wolfssl-fips-eval-archive-keyring_latest_all.deb
-apt install ./wolfssl-fips-eval-archive-keyring_latest_all.deb
-gpg --show-keys --with-fingerprint /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg
+dpkg-deb --fsys-tarfile wolfssl-fips-eval-archive-keyring_latest_all.deb \
+  | tar -xOf - ./usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg \
+  > wolfssl-fips-eval-archive-keyring.gpg
+gpg --show-keys --with-fingerprint ./wolfssl-fips-eval-archive-keyring.gpg
 ```
 
-The fingerprint must be `FA9A C397 4B00 99D4 15C7 3673 19D1 F0DB 1F30 4C7B`.
-Stop if it differs. Both channels use this archive key; it is separate from the kernel signing
-key enrolled in section 4.
+Stop if downloading, extraction or key inspection fails. Require exactly one primary key, with
+fingerprint `FA9A C397 4B00 99D4 15C7 3673 19D1 F0DB 1F30 4C7B`; confirm it against the copy
+supplied by your wolfSSL contact. Stop if it differs or additional primary keys are present.
+Both channels use this archive key; it is separate from the kernel signing key in section 4.
+
+After verifying the key, install only that public-key file:
+
+```sh
+install -m 0644 wolfssl-fips-eval-archive-keyring.gpg /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg
+```
 
 Create `/etc/apt/sources.list.d/wolfssl-fips-pve.sources`. The example selects FIPS Ready;
 for the licensed channel, replace the URI with the licensed URI in section 1.
@@ -87,9 +97,14 @@ Types: deb
 URIs: https://packages.wolfssl.com/debian
 Suites: pve9
 Components: main
-Signed-By: /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg
+Signed-By: /usr/share/keyrings/wolfssl-fips-eval-archive-keyring.gpg FA9AC3974B0099D415C7367319D1F0DB1F304C7B
 REPO
 ```
+
+The fingerprint restricts this source to the verified signing key. If wolfSSL rotates the
+primary key, confirm its replacement fingerprint before updating the key file and `Signed-By`.
+APT verifies signed repository metadata before installing packages; do not bypass signature
+errors or install the downloaded archive-key package as a workaround.
 
 Nodes intended for Ceph also need `ceph-tentacle` on the `Components:` line:
 
