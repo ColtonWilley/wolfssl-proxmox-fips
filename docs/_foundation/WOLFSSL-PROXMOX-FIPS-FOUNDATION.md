@@ -4,6 +4,10 @@ Install the wolfSSL kernel, cryptographic libraries and Proxmox integration from
 APT repository. Packages supply the binaries, signatures and service configuration; no source
 build or local patching is required.
 
+**Note:** This APT deployment model is still being evaluated for production readiness, and issues
+may remain. Send feedback and relevant diagnostic logs to `support@wolfssl.com`. Remove
+credentials, private keys and other sensitive information before sharing.
+
 Complete this guide on each node, then configure its storage with the ZFS, LUKS or Ceph guide.
 For a cluster, read [Cluster planning](../storage-cluster/WOLFSSL-PROXMOX-FIPS-CLUSTER.md)
 before installing the first node.

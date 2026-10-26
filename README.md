@@ -5,8 +5,11 @@ packages on fresh Proxmox VE nodes. The guides cover Ceph distributed storage, l
 LUKS storage, clustering, backup, and migration from existing Proxmox VE or VMware environments.
 No source build or local patching is required for the APT deployment.
 
-**Note:** This branch is a prototype for peer testing. VMware import instructions were reviewed
-against Proxmox guidance but were not rerun in the latest validation pass.
+**Note:** The APT deployment model is still being evaluated for production readiness, and issues
+may remain. Send feedback and relevant diagnostic logs using the [support instructions](#support).
+
+VMware import instructions were reviewed against Proxmox guidance but were not rerun in the
+latest validation pass.
 
 ## Choose a deployment
 
@@ -102,4 +105,7 @@ included license texts.
 
 ## Support
 
-Contact [support@wolfssl.com](mailto:support@wolfssl.com) with the guide name and section number.
+Send feedback and issue reports to [support@wolfssl.com](mailto:support@wolfssl.com). Include the
+guide name and section, a brief description of the problem, `pveversion -v`,
+`wolfssl-fips-pve-verify` output, and relevant service or task logs. Remove passwords, tokens,
+private keys and other sensitive information before sharing.
