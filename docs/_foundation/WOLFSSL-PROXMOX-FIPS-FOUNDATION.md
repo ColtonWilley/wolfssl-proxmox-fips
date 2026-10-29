@@ -29,6 +29,10 @@ and wolfSSL nodes in one cluster, and removing the integration packages are unsu
 Return a node to stock Proxmox by reinstalling it. Guests can be imported onto a freshly
 prepared target using the migration guides.
 
+For Ceph nodes, complete [Ceph, section 1](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md#1-prepare-the-ceph-packages)
+before adding the wolfSSL repository in section 3. Install the stock Tentacle packages, but do
+not initialize Ceph.
+
 Choose one repository for the installation:
 
 | Channel | Repository URI | Purpose |
@@ -106,7 +110,8 @@ primary key, confirm its replacement fingerprint before updating the key file an
 APT verifies signed repository metadata before installing packages; do not bypass signature
 errors or install the downloaded archive-key package as a workaround.
 
-Nodes intended for Ceph also need `ceph-tentacle` on the `Components:` line:
+For Ceph nodes prepared as described in section 1, include `ceph-tentacle` on the
+`Components:` line:
 
 ```text
 Components: main ceph-tentacle
@@ -187,6 +192,37 @@ before proceeding if either is used.
 Install the metapackage matching the storage selected for this node. Each storage
 metapackage brings in the shared kernel, provider, service configuration and wrappers.
 
+**Important:** Current Proxmox VE `qemu-server` and `swtpm` packages require a newer libtpms
+than the wolfSSL repository currently provides. Check the installed `swtpm` version and the
+`libtpms0` candidate:
+
+```sh
+dpkg-query -W swtpm
+apt-cache policy libtpms0
+```
+
+If `swtpm` is 0.10 or later and the `libtpms0` candidate is earlier than 0.10, install the
+following earlier versions in the same transaction as the storage metapackage. If the candidate
+is 0.10 or later, use the table command without these versions.
+
+```text
+qemu-server=9.2.12 swtpm=0.8.0+pve3 swtpm-libs=0.8.0+pve3 swtpm-tools=0.8.0+pve3
+```
+
+For Ceph-only nodes, run this command instead of the Ceph command in the table below. For
+every other profile, append all four version selections to its table command.
+
+```sh
+apt install --allow-downgrades wolfssl-fips-pve-ceph qemu-server=9.2.12 swtpm=0.8.0+pve3 swtpm-libs=0.8.0+pve3 swtpm-tools=0.8.0+pve3
+```
+
+These earlier versions omit newer upstream fixes, including the swtpm fix for CVE-2026-75900.
+Later updates keep them installed until wolfSSL publishes a compatible libtpms; see
+[Node maintenance](../_shared/WOLFSSL-PROXMOX-FIPS-NODE-CONFIGURATION.md#1-update-the-installed-packages).
+`qemu-server` 9.2.13 and later create new TPM 2.0 state with the `default-v1` profile, which
+requires libtpms 0.10 or later. Until a compatible libtpms is installed, do not import or
+restore a guest whose TPM state was created on a node running those versions.
+
 | Storage profile | Install command |
 | --- | --- |
 | Encrypted ZFS | `apt install --allow-downgrades wolfssl-fips-pve-zfs` |
@@ -195,9 +231,8 @@ metapackage brings in the shared kernel, provider, service configuration and wra
 | Ceph plus separate local LUKS volumes | `apt install --allow-downgrades wolfssl-fips-pve-ceph wolfssl-fips-pve-luks` |
 | No encrypted data storage yet | `apt install --allow-downgrades proxmox-kernel-wolfcrng wolfssl-fips-pve-config wolfssl-fips-pve-wrappers` |
 
-For Ceph, first complete the stock Tentacle package preparation in the
-[Ceph guide](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md). Do not install the Ceph and
-ZFS metapackages together. For ZFS, confirm both pin packages were installed in section 3.
+Do not install the Ceph and ZFS metapackages together. For ZFS, confirm both pin packages
+were installed in section 3.
 
 On every node, also install the compatible backup clients and SSH packages:
 
@@ -269,7 +304,10 @@ storage and configure unlock or cluster services:
 
 - [ZFS native encryption](../storage-cluster/WOLFSSL-PROXMOX-FIPS-DEPLOYMENT-ZFS.md).
 - [LUKS/dm-crypt](../storage-cluster/WOLFSSL-PROXMOX-FIPS-DEPLOYMENT-LUKS.md).
-- [Ceph](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md), after forming the new cluster.
+- [Ceph](../ceph/WOLFSSL-PROXMOX-FIPS-CEPH-DEPLOYMENT.md#2-install-and-activate-the-wolfssl-integration):
+  complete section 2, then create and verify the Proxmox cluster using
+  [Cluster, section 2](../storage-cluster/WOLFSSL-PROXMOX-FIPS-CLUSTER.md#2-create-and-verify-the-cluster)
+  before continuing with Ceph section 3.
 
 The installer-created `local`, `local-lvm` or `local-zfs` storage is not made encrypted by
 installing the common packages. Keep guest data and backups on the encrypted destinations
